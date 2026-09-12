@@ -369,8 +369,11 @@ html.dark #exportCapture{background:#231F16; color:#F3ECDC;}
             <span class="ap-label">对照原唱</span>
             <button class="btn" id="importAudioBtn">导入音频</button>
             <input type="file" id="importAudioFile" accept="audio/*" />
+            <button class="btn" id="pickFolderBtn" title="选一个文件夹，之后打开歌曲会自动按歌名去里面找同名音频，不用每次手动导入">📁 音频文件夹</button>
+            <button class="btn" id="reauthFolderBtn" style="display:none; border-color:var(--accent-o-solid); color:var(--accent-o-text);">🔓 恢复文件夹访问</button>
             <button class="btn" id="importLrcBtn">导入LRC歌词</button>
             <input type="file" id="importLrcFile" accept=".lrc,text/plain" />
+            <span class="ap-file-name" id="audioFolderName" title="当前记住的音频文件夹"></span>
             <span class="ap-file-name" id="audioFileName"></span>
           </div>
           <div class="ap-row ap-controls" id="apControls" style="display:none;">
@@ -558,7 +561,8 @@ var state = {
   dragAnchorFlatIndex: null,
   multiSelectMode: false,
   lastAutoIds: [],
-  currentAudio: null // { url, audioEl, buffer, decoding }
+  currentAudio: null, // { url, audioEl, buffer, decoding }
+  audioDirHandle: null
 };
 
 function uid(prefix){ return prefix + Math.random().toString(36).slice(2,9); }
@@ -595,6 +599,9 @@ async function loadIndex(){
   state.songIndex = raw ? JSON.parse(raw) : [];
 }
 async function saveIndex(){ await storageSafeSet('song-index', JSON.stringify(state.songIndex)); }
+// 旧版本里用过的标注类型名称，导入/加载时自动迁移成当前名称，
+// 避免因为改名导致渲染报错、整首歌白屏。
+var LEGACY_TYPE_MAP = { high:'highRight', low:'lowRight', flat:'flatRight' };
 function normalizeAnnPosition(a){
   var def = ANNOTATION_DEFS[a.type];
   if(!def) return a.position;
@@ -609,12 +616,17 @@ function normalizeAnnPosition(a){
 function normalizeSong(song){
   if(!song.lines) song.lines = [];
   if(!song.annotations) song.annotations = [];
+  song.annotations.forEach(function(a){
+    if(a && LEGACY_TYPE_MAP[a.type]) a.type = LEGACY_TYPE_MAP[a.type];
+  });
+  // 未知/已废弃的类型直接丢弃，绝不能因为一个认不出的标注拖垮整首歌的显示
+  song.annotations = song.annotations.filter(function(a){ return a && a.type && !!ANNOTATION_DEFS[a.type]; });
   var flatSet = {};
   song.lines.forEach(function(line){
     if(line.type==='text') line.chars.forEach(function(c){ flatSet[c.id]=true; });
   });
   song.annotations = song.annotations.filter(function(a){
-    return a && a.type && a.charIds && a.charIds.length>0 && a.charIds.every(function(id){ return flatSet[id]; });
+    return a.charIds && a.charIds.length>0 && a.charIds.every(function(id){ return flatSet[id]; });
   });
   song.annotations.forEach(function(a){
     a.position = normalizeAnnPosition(a);
@@ -1095,6 +1107,116 @@ function fmtTime(s){
   var m = Math.floor(s/60), sec = Math.floor(s%60);
   return (m<10?'0':'')+m+':'+(sec<10?'0':'')+sec;
 }
+/* ============================================================
+   音频文件夹自动匹配（仅 Chrome / Edge 等支持 File System Access API
+   的浏览器可用；Safari / Firefox 不支持，会自动回退为手动导入）
+============================================================ */
+function idbOpenFS(){
+  return new Promise(function(resolve, reject){
+    var req = indexedDB.open('sing-anno-fs', 1);
+    req.onupgradeneeded = function(){ req.result.createObjectStore('kv'); };
+    req.onsuccess = function(){ resolve(req.result); };
+    req.onerror = function(){ reject(req.error); };
+  });
+}
+async function idbSetFS(key, value){
+  try{
+    var db = await idbOpenFS();
+    return new Promise(function(resolve){
+      var tx = db.transaction('kv','readwrite');
+      tx.objectStore('kv').put(value, key);
+      tx.oncomplete = function(){ resolve(true); };
+      tx.onerror = function(){ resolve(false); };
+    });
+  }catch(e){ return false; }
+}
+async function idbGetFS(key){
+  try{
+    var db = await idbOpenFS();
+    return new Promise(function(resolve){
+      var tx = db.transaction('kv','readonly');
+      var req = tx.objectStore('kv').get(key);
+      req.onsuccess = function(){ resolve(req.result); };
+      req.onerror = function(){ resolve(undefined); };
+    });
+  }catch(e){ return undefined; }
+}
+function normalizeForMatch(s){
+  return (s||'').toLowerCase().replace(/[\s\-_（）()【】\[\]·.,，。！？!?]/g, '');
+}
+function updateAudioFolderUI(){
+  var nameEl = document.getElementById('audioFolderName');
+  var reauthBtn = document.getElementById('reauthFolderBtn');
+  if(!state.audioDirHandle){ nameEl.textContent = ''; reauthBtn.style.display = 'none'; return; }
+  nameEl.textContent = '📁 '+state.audioDirHandle.name;
+  state.audioDirHandle.queryPermission({ mode:'read' }).then(function(status){
+    reauthBtn.style.display = (status==='granted') ? 'none' : 'inline-block';
+  }).catch(function(){ reauthBtn.style.display = 'inline-block'; });
+}
+async function pickAudioFolder(){
+  if(!window.showDirectoryPicker){
+    toast('当前浏览器不支持自动读取文件夹（目前只有 Chrome / Edge 支持），请继续手动导入音频');
+    return;
+  }
+  try{
+    var handle = await window.showDirectoryPicker();
+    state.audioDirHandle = handle;
+    await idbSetFS('audioDir', handle);
+    updateAudioFolderUI();
+    toast('已记住这个文件夹，以后打开歌曲会自动按歌名查找同名音频');
+    var song = getCurrentSongSync();
+    if(song) tryAutoLoadAudioForSong(song);
+  }catch(e){ /* 用户取消选择，忽略 */ }
+}
+async function restoreAudioFolder(){
+  var handle = await idbGetFS('audioDir');
+  if(!handle) return;
+  state.audioDirHandle = handle;
+  updateAudioFolderUI();
+}
+async function reauthorizeAudioFolder(){
+  if(!state.audioDirHandle) return;
+  try{
+    var status = await state.audioDirHandle.requestPermission({ mode:'read' });
+    updateAudioFolderUI();
+    if(status==='granted'){
+      toast('已恢复文件夹访问权限');
+      var song = getCurrentSongSync();
+      if(song) tryAutoLoadAudioForSong(song);
+    } else {
+      toast('未获得授权，还是需要手动导入音频');
+    }
+  }catch(e){ toast('恢复授权失败，请重新选择文件夹'); }
+}
+async function tryAutoLoadAudioForSong(song){
+  if(!state.audioDirHandle || !song) return false;
+  var status;
+  try{ status = await state.audioDirHandle.queryPermission({ mode:'read' }); }catch(e){ return false; }
+  if(status!=='granted'){ updateAudioFolderUI(); return false; }
+  var target = normalizeForMatch(song.title);
+  if(!target) return false;
+  var AUDIO_EXT = ['mp3','wav','m4a','flac','ogg','aac'];
+  try{
+    for await (const [name, handle] of state.audioDirHandle.entries()){
+      if(handle.kind!=='file') continue;
+      var dot = name.lastIndexOf('.');
+      if(dot===-1) continue;
+      var ext = name.slice(dot+1).toLowerCase();
+      if(AUDIO_EXT.indexOf(ext)===-1) continue;
+      var base = normalizeForMatch(name.slice(0, dot));
+      if(base && target && (base.indexOf(target)!==-1 || target.indexOf(base)!==-1)){
+        var file = await handle.getFile();
+        if(window.__loadAudioFileObject){
+          window.__loadAudioFileObject(file);
+          toast('已按歌名自动找到并加载「'+name+'」');
+        }
+        return true;
+      }
+    }
+  }catch(e){}
+  return false;
+}
+
 function maybeShowAudioAutoBtn(){
   var song = getCurrentSongSync();
   var hasTimes = song && song.lines.some(function(l){ return l.type==='text' && typeof l.time==='number'; });
@@ -1178,9 +1300,16 @@ function bindAudioPanel(){
   document.getElementById('importAudioBtn').addEventListener('click', function(){
     document.getElementById('importAudioFile').click();
   });
+  document.getElementById('pickFolderBtn').addEventListener('click', pickAudioFolder);
+  document.getElementById('reauthFolderBtn').addEventListener('click', reauthorizeAudioFolder);
   document.getElementById('importAudioFile').addEventListener('change', function(e){
     var file = e.target.files[0];
     if(!file) return;
+    loadAudioFileObject(file);
+    e.target.value = '';
+  });
+
+  function loadAudioFileObject(file){
     resetAudioPanel();
     var url = URL.createObjectURL(file);
     var audioEl = new Audio(url);
@@ -1230,8 +1359,8 @@ function bindAudioPanel(){
       });
     };
     reader.readAsArrayBuffer(file);
-    e.target.value = '';
-  });
+  }
+  window.__loadAudioFileObject = loadAudioFileObject;
 
   document.getElementById('audioPlayBtn').addEventListener('click', togglePlay);
   document.getElementById('audioLoopBtn').addEventListener('click', toggleLoop);
@@ -1415,7 +1544,7 @@ function bindSelectionEvents(container, song){
       var ann = getAnnotation(song, annId);
       if(!ann) return;
       var def = ANNOTATION_DEFS[ann.type];
-      if(isEditableKind(def.kind)) editAnnotation(song, ann);
+      if(def && isEditableKind(def.kind)) editAnnotation(song, ann);
       else { removeAnnotation(song, annId); afterEdit(song); }
     }
   });
@@ -1458,7 +1587,7 @@ function renderLyrics(song){
         mark.setAttribute('data-ann-id', a.id);
         mark.textContent = getAnnDisplay(a);
         var def0 = ANNOTATION_DEFS[a.type];
-        mark.title = isEditableKind(def0.kind) ? '点击编辑或删除' : '点击删除';
+        mark.title = (def0 && isEditableKind(def0.kind)) ? '点击编辑或删除' : '点击删除';
         textDiv.appendChild(mark);
       });
 
@@ -1485,7 +1614,7 @@ function renderLyrics(song){
           rt.className = 'anno-inline anno-above';
           rt.setAttribute('data-ann-id', a.id);
           var d = ANNOTATION_DEFS[a.type];
-          rt.title = isEditableKind(d.kind) ? '点击编辑或删除' : '点击删除';
+          rt.title = (d && isEditableKind(d.kind)) ? '点击编辑或删除' : '点击删除';
           rt.textContent = getAnnDisplay(a);
           ruby.appendChild(rt);
         });
@@ -1503,7 +1632,7 @@ function renderLyrics(song){
         mark.setAttribute('data-ann-id', a.id);
         mark.textContent = getAnnDisplay(a);
         var def = ANNOTATION_DEFS[a.type];
-        mark.title = isEditableKind(def.kind) ? '点击编辑或删除' : '点击删除';
+        mark.title = (def && isEditableKind(def.kind)) ? '点击编辑或删除' : '点击删除';
         textDiv.appendChild(mark);
       });
     });
@@ -1625,6 +1754,7 @@ async function openSong(id){
   renderLyrics(song);
   renderSongList();
   goMobileTab('editor');
+  tryAutoLoadAudioForSong(song);
 }
 function goRelativeSong(delta){
   var ids = state.songIndex.slice().sort(function(a,b){ return (b.updatedAt||0)-(a.updatedAt||0); }).map(function(s){ return s.id; });
@@ -1979,6 +2109,7 @@ async function init(){
   bindMobileTabs();
   bindExportOverlay();
   bindAudioPanel();
+  await restoreAudioFolder();
 
   showNoSongState();
 
