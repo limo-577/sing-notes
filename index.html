@@ -1090,6 +1090,14 @@ function analyzeAudioBreaths(song, envelope){
    音频面板：导入音频/LRC、播放对照、按音频识别换气
 ============================================================ */
 function resetAudioPanel(){
+  if(state.currentAudio && state.currentAudio.audioEl){
+    try{
+      var oldEl = state.currentAudio.audioEl;
+      oldEl.pause();
+      oldEl.removeAttribute('src');
+      oldEl.load();
+    }catch(e){}
+  }
   if(state.currentAudio && state.currentAudio.url){
     try{ URL.revokeObjectURL(state.currentAudio.url); }catch(e){}
   }
@@ -1099,8 +1107,10 @@ function resetAudioPanel(){
   document.getElementById('apSeekRow').style.display = 'none';
   document.getElementById('audioAutoBtn').style.display = 'none';
   document.getElementById('audioPlayBtn').textContent = '▶';
+  document.getElementById('perfPlayBtn').textContent = '▶';
   document.getElementById('audioSeek').value = 0;
   document.getElementById('audioLoopBtn').classList.remove('active');
+  document.getElementById('perfLoopBtn').classList.remove('active');
 }
 function fmtTime(s){
   if(!isFinite(s)) return '00:00';
@@ -1754,16 +1764,26 @@ async function openSong(id){
   renderLyrics(song);
   renderSongList();
   goMobileTab('editor');
-  tryAutoLoadAudioForSong(song);
+  await tryAutoLoadAudioForSong(song);
 }
-function goRelativeSong(delta){
+async function goRelativeSong(delta){
   var ids = state.songIndex.slice().sort(function(a,b){ return (b.updatedAt||0)-(a.updatedAt||0); }).map(function(s){ return s.id; });
   var idx = ids.indexOf(state.currentId);
   if(idx===-1) return;
   var newIdx = idx + delta;
   if(newIdx<0){ toast('已经是列表里第一首了'); return; }
   if(newIdx>=ids.length){ toast('已经是列表里最后一首了'); return; }
-  openSong(ids[newIdx]);
+
+  var stayInPerf = document.getElementById('performanceOverlay').style.display !== 'none';
+  await openSong(ids[newIdx]);
+  if(stayInPerf){
+    if(state.currentAudio){
+      openPerformanceMode();
+      state.currentAudio.audioEl.play().catch(function(){});
+    } else {
+      toast('这首歌没有自动匹配到音频，已切换到标注编辑页，请手动导入音频');
+    }
+  }
 }
 function showNoSongState(){
   document.getElementById('topbar').style.display = 'none';
